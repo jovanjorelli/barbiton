@@ -1,0 +1,188 @@
+package engine
+
+import (
+	"testing"
+
+	"barbiton/pkg/dsp"
+	"barbiton/pkg/score"
+)
+
+func breathTrack(phrases []int, breath float64) score.Track {
+	tr := score.Track{
+		ID: "t", Name: "Solo",
+		Instrument: score.InstrumentDef{Type: "ocarina"},
+		Volume:     0.8,
+		BreathMs:   breath,
+	}
+	for j, p := range phrases {
+		tr.Notes = append(tr.Notes, score.NoteEvent{
+			Time: float64(j), Duration: 0.5,
+			Pitch: 60 + j, Velocity: 0.8, PhraseID: p,
+		})
+	}
+	return tr
+}
+
+func breathScore(globalBreath float64, tracks ...score.Track) *score.Score {
+	return &score.Score{
+		Metadata: score.Metadata{Title: "T", BPM: 120, TimeSignature: "4/4", BreathMs: globalBreath},
+		Tracks:   tracks,
+	}
+}
+
+func onFrames(t *testing.T, e *Engine) map[int]int {
+	t.Helper()
+	out := map[int]int{}
+	for i := range e.events {
+		ev := &e.events[i]
+		if ev.on {
+			out[ev.pitch] = ev.frame
+		}
+	}
+	return out
+}
+
+const testRate48 = 48000
+
+func TestPhraseBreath(t *testing.T) {
+	s := breathScore(0, breathTrack([]int{1, 1, 2, 2, 3, 3}, 100))
+	e, err := New(s, testRate48, 256)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	frames := onFrames(t, e)
+	at := func(sec float64) int { return int(sec * testRate48) }
+	for j, want := range map[int]int{
+		60: at(0), 61: at(1), 62: at(2), 63: at(3), 64: at(4), 65: at(5),
+	} {
+		_ = j
+		if got := frames[j]; got != want {
+			t.Errorf("pitch %d frame = %d, want %d", j, got, want)
+		}
+	}
+}
+
+func TestBreathZeroPhrase(t *testing.T) {
+	s := breathScore(0, breathTrack([]int{0, 1, 0, 2}, 100))
+	e, err := New(s, testRate48, 256)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	frames := onFrames(t, e)
+	for j := 0; j < 4; j++ {
+		if got, want := frames[60+j], j*testRate48; got != want {
+			t.Errorf("pitch %d frame = %d, want %d", 60+j, got, want)
+		}
+	}
+}
+
+func TestBreathDefault(t *testing.T) {
+	s := breathScore(0, breathTrack([]int{1, 2, 3}, 0))
+	e, err := New(s, testRate48, 256)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	frames := onFrames(t, e)
+	for j := 0; j < 3; j++ {
+		if got, want := frames[60+j], j*testRate48; got != want {
+			t.Errorf("pitch %d frame = %d, want %d", 60+j, got, want)
+		}
+	}
+}
+
+func TestBreathOverride(t *testing.T) {
+	s := breathScore(50, breathTrack([]int{1, 2}, 120))
+	e, err := New(s, testRate48, 256)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	frames := onFrames(t, e)
+	if got, want := frames[60], 0; got != want {
+		t.Errorf("first phrase frame = %d, want %d", got, want)
+	}
+	if got, want := frames[61], testRate48; got != want {
+		t.Errorf("second phrase frame = %d, want %d", got, want)
+	}
+}
+
+func roomTrack(id, room string) score.Track {
+	tr := score.Track{
+		ID: id, Name: id,
+		Instrument: score.InstrumentDef{Type: "ocarina"},
+		Volume:     0.8,
+	}
+	if room != "" {
+		r := &score.Room{}
+		if err := r.UnmarshalJSON([]byte(room)); err != nil {
+			panic(err)
+		}
+		tr.Room = r
+	}
+	tr.Notes = append(tr.Notes, score.NoteEvent{Time: 0, Duration: 0.5, Pitch: 60, Velocity: 0.8})
+	return tr
+}
+
+func TestRoomPreset(t *testing.T) {
+	s := breathScore(0, roomTrack("t", `"cathedral"`))
+	e, err := New(s, testRate48, 256)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	want, _ := dsp.PresetParams("cathedral")
+	got, ok := e.Mixer().TrackRoom(0)
+	if !ok {
+		t.Fatal("track has no room override")
+	}
+	if got != want {
+		t.Fatalf("room params = %+v, want %+v", got, want)
+	}
+}
+
+func TestRoomObject(t *testing.T) {
+	s := breathScore(0, roomTrack("t", `{"size": 0.7, "damping": 0.4, "width": 0.8}`))
+	e, err := New(s, testRate48, 256)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	got, ok := e.Mixer().TrackRoom(0)
+	if !ok {
+		t.Fatal("track has no room override")
+	}
+	if got.RoomSize != 0.7 || got.Damping != 0.4 || got.Width != 0.8 {
+		t.Fatalf("room params = %+v, want 0.7/0.4/0.8", got)
+	}
+}
+
+func TestRoomMaster(t *testing.T) {
+	s := breathScore(0, roomTrack("t", ""))
+	e, err := New(s, testRate48, 256)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if _, ok := e.Mixer().TrackRoom(0); ok {
+		t.Fatal("roomless track reports an override")
+	}
+}
+
+func TestRoomMultiple(t *testing.T) {
+	s := breathScore(0,
+		roomTrack("a", `"cathedral"`),
+		roomTrack("b", `"hall"`),
+		roomTrack("c", `"room"`))
+	e, err := New(s, testRate48, 256)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	for i, name := range []string{"cathedral", "hall", "room"} {
+		want, _ := dsp.PresetParams(name)
+		got, ok := e.Mixer().TrackRoom(i)
+		if !ok {
+			t.Fatalf("track %d has no room override", i)
+		}
+		if got != want {
+			t.Fatalf("track %d room = %+v, want %s %+v", i, got, name, want)
+		}
+	}
+
+	e.ProcessFrames(e.TotalFrames(), nil)
+}
